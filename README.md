@@ -707,22 +707,6 @@ the class in `sysmon.py` to match.
 On macOS and other systems the script runs with the data psutil provides and
 says so in the header. This hasn't been tested.
 
-## Tests
-
-```bash
-python test_sysmon.py
-```
-
-It needs no extra packages (pytest also works). Most tests feed recorded or
-hand-made data to the parsers, so they run anywhere. A few check the real
-system: rendering every view on this machine, the Windows process list against
-psutil, and the Windows disk queries. The remote monitoring tests start a
-server on a free local port and send it real updates, including from a sysmon
-started without a terminal, and over HTTPS (that test makes its certificates
-with `openssl` and skips itself without it). Tests that need Windows, Linux,
-or admin / root rights skip themselves elsewhere. Run it as administrator / with `sudo`
-to also test network counting per process.
-
 ## Troubleshooting
 
 | Problem | Fix |
@@ -754,7 +738,6 @@ to also test network counting per process.
 | `sysmon.py` | The monitor (single file) |
 | `sysmon_server.py` | The [remote monitoring](#remote-monitoring) server and web page |
 | `sysmon.ini` | Settings: sections, thresholds and colors |
-| `test_sysmon.py` | Tests |
 | `requirements.txt` | Python dependencies |
 | `README.md` | This documentation |
 | `CHANGELOG.md` | What changed in each version |
