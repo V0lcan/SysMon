@@ -12,10 +12,12 @@ fan speeds and battery, refreshing once per second by default.
     python sysmon.py --once           # print a single snapshot and exit
     python sysmon.py --json           # print a single snapshot as JSON and exit
     python sysmon.py --log usage.csv  # also append every update to a CSV file
+    python sysmon.py --report usage.csv  # turn that log into usage.html, a page with graphs
+    python sysmon.py --svg sysmon.svg    # save a picture of the screen
     python sysmon.py --connect 192.168.1.10:8765  # also send it to sysmon_server.py
 
-F1 / P opens a process table (sortable, can end processes), F2 / G opens usage
-graphs. Sections, thresholds and colors are set in sysmon.ini next to this script.
+F1 / P opens a process table (sort, filter by name, tree view, end processes), F2 / G
+opens usage graphs. Sections, thresholds and colors are set in sysmon.ini next to this script.
 
 Where the data comes from:
     everywhere  psutil (CPU, memory, disks, network, battery, processes) and
@@ -43,6 +45,7 @@ import configparser
 import csv
 import ctypes
 import glob
+import html
 import itertools
 import json
 import math
@@ -1139,14 +1142,15 @@ class _ProcessInfo(ctypes.Structure):  # SYSTEM_PROCESS_INFORMATION, 64-bit layo
                 ("UserTime", ctypes.c_int64), ("KernelTime", ctypes.c_int64),
                 ("NameLength", ctypes.c_uint16), ("NameMaxLength", ctypes.c_uint16),
                 ("NameBuffer", ctypes.c_void_p), ("BasePriority", ctypes.c_int32),
-                ("UniqueProcessId", ctypes.c_void_p), ("_unused2", ctypes.c_byte * 144),
+                ("UniqueProcessId", ctypes.c_void_p), ("InheritedFromUniqueProcessId", ctypes.c_void_p),
+                ("_unused2", ctypes.c_byte * 136),
                 ("ReadTransferCount", ctypes.c_int64), ("WriteTransferCount", ctypes.c_int64)]
 
 
 def windows_processes():
-    """{pid: (name, CPU seconds, private working set, I/O bytes)} for every process, from a
-    single system call. psutil opens each process separately and rescans the whole system
-    for every protected one, which takes ~2 s per update with ~400 processes."""
+    """{pid: (name, CPU seconds, private working set, I/O bytes, parent pid)} for every process,
+    from a single system call. psutil opens each process separately and rescans the whole
+    system for every protected one, which takes ~2 s per update with ~400 processes."""
     if ctypes.sizeof(ctypes.c_void_p) != 8:
         return {}  # ponytail: 64-bit layout only; 32-bit Python would need its own offsets
     ntdll = ctypes.WinDLL("ntdll")
@@ -1165,7 +1169,8 @@ def windows_processes():
             procs[info.UniqueProcessId] = (ctypes.wstring_at(info.NameBuffer, info.NameLength // 2),
                                            (info.UserTime + info.KernelTime) / 1e7,
                                            info.WorkingSetPrivateSize,
-                                           info.ReadTransferCount + info.WriteTransferCount)
+                                           info.ReadTransferCount + info.WriteTransferCount,
+                                           info.InheritedFromUniqueProcessId or 0)
         if not info.NextEntryOffset:
             break
         offset += info.NextEntryOffset
@@ -1173,17 +1178,18 @@ def windows_processes():
 
 
 def process_snapshot():
-    """{pid: (name, CPU seconds, memory bytes, I/O bytes)} for every process we can see."""
+    """{pid: (name, CPU seconds, memory bytes, I/O bytes, parent pid)} for every process we can see."""
     if IS_WINDOWS:
         return windows_processes()
     procs = {}
-    for proc in psutil.process_iter(["name", "cpu_times", "memory_info", "io_counters"]):
+    for proc in psutil.process_iter(["name", "cpu_times", "memory_info", "io_counters", "ppid"]):
         info = proc.info  # fields we may not read (other users' I/O) are None
         io = info["io_counters"]
         procs[proc.pid] = (info["name"] or "?",
                            sum(info["cpu_times"][:2]) if info["cpu_times"] else 0.0,
                            info["memory_info"].rss if info["memory_info"] else 0,
-                           io.read_bytes + io.write_bytes if io else 0)
+                           io.read_bytes + io.write_bytes if io else 0,
+                           info["ppid"] or 0)
     return procs
 
 
@@ -1230,7 +1236,8 @@ def linux_gpu_by_pid(now, before, dt):
     return usage
 
 
-Row = namedtuple("Row", "key label pids values")  # a process table row; key: pid, or name when grouped
+# A process table row. key: pid, or the name when grouped; prefix: the tree branches before the label.
+Row = namedtuple("Row", "key label pids values prefix", defaults=("",))
 
 PROCESS_COLUMNS = {  # column: (title, width, format)
     "cpu": ("CPU", 6, "{:.1f}%".format),
@@ -1260,11 +1267,38 @@ def process_rows(procs, group):
             for name, (pids, totals) in programs.items()]
 
 
-def top_rows(rows, column, totals, limit):
-    """The `limit` rows using the most of `column`, leaving out those under 0.1% of its total."""
+def top_rows(rows, column, totals, limit=None, keep_idle=False):
+    """The rows using the most of `column`, busiest first: all of them with keep_idle, else only
+    those using at least 0.1% of its total; `limit` keeps the first ones."""
     floor = totals.get(column, 0) * 0.001
-    used = [row for row in rows if row.values.get(column, 0) > 0 and row.values[column] >= floor]
-    return sorted(used, key=lambda row: row.values[column], reverse=True)[:limit]
+    used = [row for row in rows if keep_idle or (row.values.get(column, 0) > 0 and row.values[column] >= floor)]
+    return sorted(used, key=lambda row: row.values.get(column, 0), reverse=True)[:limit]
+
+
+def tree_rows(rows, parents, column):
+    """rows as a process tree: each under its parent, siblings busiest first, with the branch
+    lines in their prefix. A process whose parent isn't in rows is at the top level."""
+    listed, children, seen, out = {row.key for row in rows}, {}, set(), []
+    for row in rows:
+        parent = parents.get(row.key)
+        children.setdefault(parent if parent in listed and parent != row.key else None, []).append(row)
+    busiest = lambda row: row.values.get(column, 0)
+
+    def add(parent, indent):
+        kids = [row for row in sorted(children.get(parent, []), key=busiest, reverse=True) if row.key not in seen]
+        for i, row in enumerate(kids):
+            last = i == len(kids) - 1
+            seen.add(row.key)
+            out.append(row._replace(prefix="" if parent is None else indent + ("└─ " if last else "├─ ")))
+            add(row.key, "" if parent is None else indent + ("   " if last else "│  "))
+
+    add(None, "")
+    for row in sorted(rows, key=busiest, reverse=True):  # parents of each other (a reused pid): no top level
+        if row.key not in seen:
+            seen.add(row.key)
+            out.append(row)
+            add(row.key, "")
+    return out
 
 
 def end_processes(label, processes):
@@ -1297,6 +1331,9 @@ class View:
     help: bool = False
     sort: str = "cpu"             # process table column
     group: bool = False           # one row per program instead of per process
+    tree: bool = False            # processes under their parents
+    filter: str = ""              # only processes whose name contains this (lowercase)
+    typing: bool = False          # the keys go to the filter
     selected: object = None       # the selected row's key: a pid, or a program name when grouped
     cursor: int = 0               # the selected row's position
     confirm: tuple | None = None  # (label, psutil processes) waiting for Y to end them
@@ -1316,6 +1353,13 @@ class View:
             self.message = end_processes(label, processes) if key == "y" else "Not ended"
             return
         self.message = ""
+        if self.typing and key not in ("UP", "DOWN"):  # typing a filter: letters are text, not commands
+            if key in ("ENTER", "ESC"):
+                self.typing = False
+            if key in ("ESC", "BACKSPACE") or len(key) == 1 and key.isprintable():
+                self.filter = "" if key == "ESC" else self.filter[:-1] if key == "BACKSPACE" else self.filter + key
+                self.selected, self.cursor = None, 0
+            return
         pane = {"F1": "processes", "p": "processes", "F2": "graphs", "g": "graphs"}.get(key)
         in_table, in_graphs = "processes" in self.panes, "graphs" in self.panes
         if pane:
@@ -1331,8 +1375,14 @@ class View:
         elif in_table and key in ("LEFT", "RIGHT") and columns:
             i = columns.index(self.sort) if self.sort in columns else 0
             self.sort = columns[(i + (1 if key == "RIGHT" else -1)) % len(columns)]
+        elif in_table and key == "/":
+            self.typing = True
+        elif in_table and key == "ESC" and self.filter:
+            self.filter, self.selected, self.cursor = "", None, 0
+        elif in_table and key == "t":  # a tree of programs makes no sense: tree and group exclude each other
+            self.tree, self.group, self.selected, self.cursor = not self.tree, False, None, 0
         elif in_table and key == "a":
-            self.group, self.selected, self.cursor = not self.group, None, 0
+            self.group, self.tree, self.selected, self.cursor = not self.group, False, None, 0
         elif in_table and key in ("k", "DELETE") and rows:
             if IS_LINUX and not is_admin():
                 self.message = "Ending processes needs root: start sysmon with sudo"
@@ -1370,6 +1420,8 @@ Panes
 Process table
   Up / Down       Select a process
   Left / Right    Sort by another column
+  /               Filter by name (Enter keeps the filter, Esc clears it)
+  T               Show the processes as a tree
   A               Group processes by program
   K or Delete     End the selected process (asks first; needs sudo on Linux)
 Graphs
@@ -1401,6 +1453,7 @@ class Monitor:
         self.snapshot = {}  # the latest data, for --json, --log and --connect
         self.history = {}   # graph page -> {name: [recent values, kind, top]}; kept while F2 is closed
         self.last_rows, self.process_columns = [], ["cpu", "memory", "io"]  # process table as drawn
+        self.parents = {}   # pid -> parent pid, for the tree view
         self.vram_total = 0
 
         # The data sources this platform has; the others stay None.
@@ -1753,6 +1806,7 @@ class Monitor:
         """({pid: (name, {column: value})}, {column: total}) for the process table."""
         snapshot = process_snapshot()
         before, self.prev_procs = self.prev_procs, snapshot
+        self.parents = {pid: p[4] for pid, p in snapshot.items()}  # for the tree view
         if IS_WINDOWS:
             gpu = windows_by_pid(counters, "gpu_engine", max)
             vram = windows_by_pid(counters, "gpu_process_vram", lambda a, b: a + b)
@@ -1768,7 +1822,7 @@ class Monitor:
 
         cores = psutil.cpu_count() or 1
         procs = {}
-        for pid, (name, cpu_seconds, memory, io_bytes) in snapshot.items():
+        for pid, (name, cpu_seconds, memory, io_bytes, _) in snapshot.items():
             values = {"memory": memory}
             if before and before.get(pid, ("",))[0] == name:  # same pid and program as last time
                 values["cpu"] = max(0.0, cpu_seconds - before[pid][1]) / dt / cores * 100  # % of the whole CPU
@@ -1785,14 +1839,21 @@ class Monitor:
         return procs, totals, before is not None
 
     def _processes_pane(self, width, height, dt, counters, view):
-        """The process table (F1 / P) as lines, sorted and grouped as `view` says."""
+        """The process table (F1 / P) as lines: sorted, filtered, grouped or as a tree as `view` says."""
         procs, totals, measured = self._process_values(dt, counters)
         columns = self.process_columns
         if view.sort not in columns:
             view.sort = "cpu"
-        rows = top_rows(process_rows(procs, view.group), view.sort, totals, max(5, height - 10))
+        if view.filter:
+            procs = {pid: p for pid, p in procs.items() if view.filter in p[0].lower()}
+        # A filter or the tree lists idle processes too; otherwise only the busy ones show.
+        rows = top_rows(process_rows(procs, view.group), view.sort, totals, keep_idle=bool(view.filter or view.tree))
+        if view.tree:
+            rows = tree_rows(rows, self.parents, view.sort)
         self.last_rows = rows
         view.sync_selection(rows)
+        fits = max(5, height - 10)
+        start = max(0, view.cursor - fits + 1)  # scrolled just enough to keep the selection on screen
 
         # The sort column always shows; the others as the width allows, in their usual order.
         name_w = 14
@@ -1805,21 +1866,28 @@ class Monitor:
         shown = [column for column in columns if column in shown]
         name_w = max(4, name_w + room)  # a very narrow window leaves no room to spare
 
-        title = "Programs" if view.group else "Processes"
-        lines = [paint(f"{title} by {PROCESS_COLUMNS[view.sort][0]}", BOLD),
-                 paint("↑↓ select  ←→ sort  A group  K end  P hide", DIM), ""]
+        title = "Programs" if view.group else "Process tree" if view.tree else "Processes"
+        title += f" by {PROCESS_COLUMNS[view.sort][0]}"
+        if view.filter and not view.typing:
+            title += f", name contains '{view.filter}'"
+        hint = (f"Filter: {view.filter}█  Enter keep  Esc clear" if view.typing else
+                "↑↓ select  ←→ sort  / filter  T tree  A group  K end  P hide")
+        lines = [paint(title, BOLD), paint(hint, DIM), ""]
         header = f"  {'PID':>7} {'Name':<{name_w}}" + "".join(
             f" {('▼' if c == view.sort else '') + PROCESS_COLUMNS[c][0]:>{PROCESS_COLUMNS[c][1]}}" for c in shown)
         lines.append(paint(header, BOLD))
-        for i, row in enumerate(rows):
+        for i, row in enumerate(rows[start:start + fits], start):
             pid = str(row.key) if not view.group else ""
-            text = f"  {pid:>7} {row.label[:name_w]:<{name_w}}" + "".join(
+            text = f"  {pid:>7} {(row.prefix + row.label)[:name_w]:<{name_w}}" + "".join(
                 f" {PROCESS_COLUMNS[c][2](row.values[c]) if c in row.values else '-':>{PROCESS_COLUMNS[c][1]}}"
                 for c in shown)
             lines.append(paint(text, REVERSE) if i == view.cursor else text)
         if not rows:
             waiting = view.sort in RATE_COLUMNS and not measured
-            lines.append(paint("  measuring..." if waiting else "  nothing above 0.1%", DIM))
+            lines.append(paint(f"  no process name contains '{view.filter}'" if view.filter else
+                               "  measuring..." if waiting else "  nothing above 0.1%", DIM))
+        elif len(rows) > fits:
+            lines.append(paint(f"  {start + 1}-{min(start + fits, len(rows))} of {len(rows)}", DIM))
         lines.append("")
         if view.confirm:
             lines.append(paint(f"End {view.confirm[0]}? Y ends it, any other key cancels", COLOR["high"]))
@@ -1879,7 +1947,8 @@ KEY_NAMES = {"\x1bOP": "F1", "\x1b[11~": "F1", "\x1b[[A": "F1",
              "\x1bOQ": "F2", "\x1b[12~": "F2", "\x1b[[B": "F2",
              "\x1b[A": "UP", "\x1bOA": "UP", "\x1b[B": "DOWN", "\x1bOB": "DOWN",
              "\x1b[C": "RIGHT", "\x1bOC": "RIGHT", "\x1b[D": "LEFT", "\x1bOD": "LEFT",
-             "\x1b[3~": "DELETE", "\x1b": "ESC", "\t": "TAB", "\r": "ENTER", "\n": "ENTER"}
+             "\x1b[3~": "DELETE", "\x1b": "ESC", "\t": "TAB", "\r": "ENTER", "\n": "ENTER",
+             "\x7f": "BACKSPACE", "\x08": "BACKSPACE"}  # terminals send \x7f, the Windows console \x08
 # Splits input into whole escape sequences and single characters.
 KEY_TOKEN_RE = re.compile(r"\x1b\[\[[A-E]|\x1b\[[0-9;]*[~A-Za-z]|\x1bO.|\x1b|.", re.S)
 # The Windows console (msvcrt) sends special keys as "\x00" or "\xe0" followed by one of these.
@@ -1972,6 +2041,169 @@ class CsvLog:
             if new:
                 writer.writeheader()
             writer.writerow(row)
+
+
+# --- Pictures and reports ----------------------------------------------------
+
+# What sysmon's color codes look like, as sysmon_server.py's page shows them (VS Code's terminal colors).
+TERMINAL_COLORS = {30: "#000000", 31: "#cd3131", 32: "#0dbc79", 33: "#e5e510", 34: "#2472c8", 35: "#bc3fbc",
+                   36: "#11a8cd", 37: "#e5e5e5", 90: "#767676", 91: "#f14c4c", 92: "#23d18b", 93: "#f5f543",
+                   94: "#3b8eea", 95: "#d670d6", 96: "#29b8db", 97: "#ffffff"}
+
+
+def svg_screenshot(lines):
+    """The screen as an SVG picture of a terminal (--svg). Bars and rules are drawn as shapes, not
+    characters, so they line up in whatever font the viewer has."""
+    cw, lh, pad, fg = 8.4, 18, 16, "#cccccc"  # cell width, line height, margin, default text color
+    screen = []
+    for line in lines:
+        cells, color, bold, dim = [], fg, False, False
+        for part in re.split(r"(\x1b\[[\d;]*m)", line):
+            codes = re.fullmatch(r"\x1b\[([\d;]*)m", part)
+            if not codes:
+                cells += [(char, color, bold, dim) for char in part]
+                continue
+            for code in (int(c) for c in codes.group(1).split(";") if c):
+                if code == 0:
+                    color, bold, dim = fg, False, False
+                bold, dim = bold or code == 1, dim or code == 2
+                color = TERMINAL_COLORS.get(code, color)  # 256-color codes keep the previous color
+        screen.append(cells)
+    w, h = round(max((len(cells) for cells in screen), default=0) * cw + 2 * pad), len(screen) * lh + 2 * pad
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">',
+           "<style>text{font:14px 'Cascadia Mono',Consolas,'DejaVu Sans Mono',Menlo,monospace;white-space:pre}</style>",
+           f'<rect width="{w}" height="{h}" rx="8" fill="#0c0c0c"/>']
+    for row, cells in enumerate(screen):
+        top, col = pad + row * lh, 0
+        # Runs of one kind of character in one style: bars, half blocks, rule lines, spaces or text.
+        for (kind, color, bold, dim), run in itertools.groupby(cells, lambda c: (c[0] if c[0] in "█▄─ " else "t",) + c[1:]):
+            chars = "".join(c[0] for c in run)
+            x, width, col = pad + col * cw, len(chars) * cw, col + len(chars)
+            style = f' fill="{color}"' + (' opacity=".6"' if dim else "") + (' font-weight="bold"' if bold and kind == "t" else "")
+            if kind == "█":
+                out.append(f'<rect x="{x:.1f}" y="{top + 2}" width="{width:.1f}" height="{lh - 4}"{style}/>')
+            elif kind == "▄":
+                out.append(f'<rect x="{x:.1f}" y="{top + lh / 2}" width="{width:.1f}" height="{lh / 2}"{style}/>')
+            elif kind == "─":
+                out.append(f'<rect x="{x:.1f}" y="{top + lh / 2 - 0.6}" width="{width:.1f}" height="1.2"{style}/>')
+            elif kind == "t":  # textLength keeps every run on its columns
+                out.append(f'<text x="{x:.1f}" y="{top + lh - 5}" textLength="{width:.1f}"{style}>{html.escape(chars)}</text>')
+    return "\n".join(out + ["</svg>"]) + "\n"
+
+
+# The report's graphs: (title, unit, top of the scale or None for the highest value, [(CSV column, label)]).
+# In a column, * stands for a name (a GPU, disk, network adapter or sensor); {} in the label shows it.
+REPORT_CHARTS = [
+    ("CPU", "%", 100, [("cpu.usage_percent", "all cores")]),
+    ("Memory", "%", 100, [("memory.percent", "RAM"), ("memory.swap.percent", "swap / page file")]),
+    ("GPU load", "%", 100, [("gpus.*.util", "{}")]),
+    ("Disk speed", "B/s", None, [("disks.drives.*.read_bps", "{} read"), ("disks.drives.*.write_bps", "{} write")]),
+    ("Network", "B/s", None, [("network.*.download_bps", "{} download"), ("network.*.upload_bps", "{} upload")]),
+    ("Temperatures", "°C", None, [("sensors.temperatures.*", "{}"), ("gpus.*.temp", "{}"),
+                                  ("disks.drives.*.temperature", "{}")]),
+    ("Disk space used", "%", 100, [("disks.volumes.*.percent", "{}")]),
+    ("Battery", "%", 100, [("battery.percent", "charge")]),
+]
+REPORT_COLORS = ("#29b8db", "#23d18b", "#f5f543", "#d670d6", "#f14c4c", "#3b8eea", "#e5e5e5", "#e5e510")
+
+
+def _report_chart(title, unit, top, series, times):
+    """One graph of the report: an SVG with a line per series, and a table of min / average / max."""
+    fmt = fmt_rate if unit == "B/s" else lambda v: f"{v:.0f} {unit}"
+    top = top or max(v for _, values in series for v in values if v is not None) * 1.1 or 1
+    w, h, left, right, above, below = 960, 220, 84, 12, 10, 26
+    t0, span = times[0], max(times[-1] - times[0], 1)
+    buckets = min(len(times), 600)  # each point averages the updates in its slice of the time span
+    slot = [min(buckets - 1, int((t - t0) / span * buckets)) for t in times]
+    # Lines break where sysmon wasn't running: 5 times the usual interval without an update.
+    steps = sorted(b - a for a, b in zip(times, times[1:]) if b > a)
+    gap = 5 * (steps[len(steps) // 2] if steps else 1)
+    run = list(itertools.accumulate([0] + [int(b - a > gap) for a, b in zip(times, times[1:])]))
+    svg = [f'<svg viewBox="0 0 {w} {h}" role="img" aria-label="{html.escape(title)}">']
+    for frac in (0, 0.5, 1):
+        y = above + (1 - frac) * (h - above - below)
+        svg.append(f'<line x1="{left}" x2="{w - right}" y1="{y:.1f}" y2="{y:.1f}" class="grid"/>'
+                   f'<text x="{left - 8}" y="{y + 4:.1f}" text-anchor="end">{html.escape(fmt(top * frac))}</text>')
+    for frac, anchor in ((0, "start"), (1, "end")):
+        stamp = time.strftime("%Y-%m-%d %H:%M" if span >= 3600 else "%H:%M:%S", time.localtime(t0 + frac * span))
+        svg.append(f'<text x="{left + frac * (w - left - right):.1f}" y="{h - 6}" text-anchor="{anchor}">{stamp}</text>')
+    rows = []
+    for k, (label, values) in enumerate(series):
+        color, sums, counts = REPORT_COLORS[k % len(REPORT_COLORS)], {}, {}
+        for key, v in zip(zip(run, slot), values):  # key: (stretch of logging, slice of time)
+            if v is not None:
+                sums[key] = sums.get(key, 0.0) + v
+                counts[key] = counts.get(key, 0) + 1
+        lines = {}
+        for r, s in sorted(sums):
+            x = left + (s + 0.5) / buckets * (w - left - right)
+            y = above + (1 - min(sums[r, s] / counts[r, s] / top, 1)) * (h - above - below)
+            lines.setdefault(r, []).append(f"{x:.1f},{y:.1f}")
+        for points in lines.values():  # one line per stretch; a lone update shows as a dot
+            svg.append(f'<polyline points="{" ".join(points if len(points) > 1 else points * 2)}" stroke="{color}"/>')
+        known = [v for v in values if v is not None]
+        rows.append(f'<tr><td><span style="background:{color}"></span>{html.escape(label)}</td>'
+                    + "".join(f"<td>{html.escape(fmt(v))}</td>" for v in
+                              (min(known), sum(known) / len(known), max(known), known[-1])) + "</tr>")
+    return (f"<section><h2>{html.escape(title)}</h2>{''.join(svg)}</svg><table><tr><th></th><th>min</th>"
+            f"<th>average</th><th>max</th><th>last</th></tr>{''.join(rows)}</table></section>")
+
+
+def write_report(csv_path):
+    """Turn a --log CSV file into a self-contained HTML page with graphs (--report). Returns the
+    page's path: the CSV's, ending in .html instead."""
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        records = list(csv.DictReader(f))
+    times, columns = [], {}
+    for record in records:
+        try:
+            times.append(time.mktime(time.strptime(record.get("time") or "", "%Y-%m-%dT%H:%M:%S")))
+        except ValueError:
+            continue  # not a row sysmon wrote
+        for column, value in record.items():
+            if column not in (None, "time"):
+                columns.setdefault(column, []).append(to_float(value))
+    if not times:
+        raise ValueError("no updates in it (is it a sysmon --log file?)")
+    sections = []
+    for title, unit, top, patterns in REPORT_CHARTS:
+        series = []
+        for pattern, label in patterns:
+            match = re.compile(re.escape(pattern).replace(r"\*", "(.+)"))
+            for column, values in columns.items():
+                found = match.fullmatch(column)
+                if found and any(v is not None for v in values):
+                    series.append((label.format(*found.groups()), values))
+        if series:
+            sections.append(_report_chart(title, unit, top, series, times))
+    name, first, last = os.path.basename(csv_path), time.localtime(times[0]), time.localtime(times[-1])
+    page = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sysmon report: {html.escape(name)}</title>
+<style>
+  body {{ margin: 0 auto; max-width: 1000px; padding: 24px 16px; background: #0c0c0c; color: #cccccc;
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }}
+  h1 {{ margin: 0 0 4px; font-size: 22px; }} h2 {{ margin: 0 0 8px; font-size: 16px; }}
+  .muted {{ color: #8a8a8a; margin: 0 0 20px; }}
+  section {{ background: #161616; border: 1px solid #2c2c2c; border-radius: 6px; padding: 14px 16px; margin-bottom: 16px; }}
+  svg {{ width: 100%; height: auto; display: block; }}
+  svg text {{ fill: #8a8a8a; font-size: 12px; }} .grid {{ stroke: #2c2c2c; }}
+  polyline {{ fill: none; stroke-width: 1.6; stroke-linejoin: round; stroke-linecap: round; }}
+  table {{ border-collapse: collapse; margin-top: 8px; font-variant-numeric: tabular-nums; }}
+  th, td {{ padding: 2px 14px 2px 0; text-align: right; }} th:first-child, td:first-child {{ text-align: left; }}
+  th {{ color: #8a8a8a; font-weight: 400; }}
+  td span {{ display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 8px; }}
+</style></head><body>
+<h1>sysmon report</h1>
+<p class="muted">{html.escape(name)}: {len(times)} updates from {time.strftime("%Y-%m-%d %H:%M:%S", first)}
+to {time.strftime("%Y-%m-%d %H:%M:%S", last)}</p>
+{"".join(sections)}
+</body></html>
+"""
+    path = os.path.splitext(csv_path)[0] + ".html"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(page)
+    return path
 
 
 # --- Remote monitoring -------------------------------------------------------
@@ -2108,7 +2340,10 @@ def parse_args():
                         help="seconds between updates (default: 1)")
     parser.add_argument("--once", action="store_true", help="print a single snapshot and exit")
     parser.add_argument("--json", action="store_true", help="print a single snapshot as JSON and exit")
+    parser.add_argument("--svg", metavar="FILE", help="save a single snapshot of the screen as an SVG picture and exit")
     parser.add_argument("--log", metavar="FILE", help="append every update to this CSV file")
+    parser.add_argument("--report", metavar="CSV",
+                        help="turn a --log CSV file into an HTML page with graphs (saved next to it as .html) and exit")
     parser.add_argument("--config", metavar="FILE",
                         help="settings file (default: sysmon.ini next to this script, if it exists)")
     parser.add_argument("--connect", metavar="IP:PORT", type=server_address,
@@ -2123,8 +2358,8 @@ def parse_args():
     args = parser.parse_args()
     if args.interval < 0.1:
         parser.error("interval must be at least 0.1 seconds")
-    if args.connect and (args.once or args.json):
-        parser.error("--connect sends live updates, so it can't be used with --once or --json")
+    if args.connect and (args.once or args.json or args.svg):
+        parser.error("--connect sends live updates, so it can't be used with --once, --json or --svg")
     if args.server_cert and not args.connect:
         parser.error("--server-cert goes with --connect")
     return args
@@ -2133,6 +2368,12 @@ def parse_args():
 def main():
     global USE_COLOR
     args = parse_args()
+    if args.report:  # only reads the CSV file: nothing to measure
+        try:
+            print(f"Report saved as {write_report(args.report)}")
+        except (OSError, ValueError, csv.Error) as error:
+            sys.exit(f"Can't make a report from {args.report}: {error}")
+        return
     # --config, else sysmon.ini next to this script if there is one, else the built-in defaults.
     settings = args.config or (SETTINGS_FILE if os.path.exists(SETTINGS_FILE) else None)
     try:
@@ -2143,8 +2384,8 @@ def main():
         log = CsvLog(args.log) if args.log else None
     except OSError as error:
         sys.exit(f"Can't write the log file {args.log}: {error.strerror}")
-    # Colors also when the screen only goes to the web page (--connect without a terminal).
-    USE_COLOR = (sys.stdout.isatty() or bool(args.connect)) and not args.json
+    # Colors also when the screen only goes to the web page (--connect without a terminal) or a picture.
+    USE_COLOR = (sys.stdout.isatty() or bool(args.connect or args.svg)) and not args.json
     sys.stdout.reconfigure(encoding="utf-8")  # e.g. Windows defaults to cp1252 when redirected
     if IS_WINDOWS and USE_COLOR:
         enable_ansi_on_windows()
@@ -2158,14 +2399,21 @@ def main():
         sys.exit(f"Can't use the server certificate {args.server_cert}: {error}")
     monitor = Monitor(args.interval, settings, remote)
     try:
-        if args.once or args.json:
+        if args.once or args.json or args.svg:
             time.sleep(args.interval)  # rates (CPU %, network, disk I/O) need two samples
-            cols, rows = shutil.get_terminal_size()
-            lines = monitor.render(cols - 1, rows, View())
+            cols, rows = shutil.get_terminal_size()  # without a terminal: $COLUMNS, else 80
+            lines = [truncate(line, cols - 1) for line in monitor.render(cols - 1, rows, View())]
             if log:
                 log.write(monitor.snapshot)
-            print(json.dumps(monitor.snapshot, indent=2) if args.json
-                  else "\n".join(truncate(line, cols - 1) for line in lines))
+            if args.svg:
+                try:
+                    with open(args.svg, "w", encoding="utf-8") as f:
+                        f.write(svg_screenshot(lines))
+                except OSError as error:
+                    sys.exit(f"Can't write {args.svg}: {error.strerror}")
+                print(f"Saved {args.svg}")
+            else:
+                print(json.dumps(monitor.snapshot, indent=2) if args.json else "\n".join(lines))
         elif (remote or log) and not sys.stdout.isatty():  # don't pour screens into a log or journal
             print("sysmon: the output isn't a terminal, so nothing is drawn; --log / --connect keep working",
                   file=sys.stderr, flush=True)

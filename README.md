@@ -5,13 +5,15 @@ detects the operating system at startup, picks the best data source available
 on that platform, and redraws the screen in place once per second (or at the
 interval you choose).
 
-- **F1 / P** opens a process table you can sort, group by program, and end
-  processes from.
+- **F1 / P** opens a process table you can sort, filter by name, show as a
+  tree, group by program, and end processes from.
 - **F2 / G** opens usage graphs: overview, every CPU core, GPU, each disk and
   network adapter, and temperatures, over 1 to 60 minutes.
 - **H** shows all keys.
-- `--log` records every update to a CSV file, `--json` prints one snapshot for
-  other scripts, and `sysmon.ini` sets which sections show and their colors.
+- `--log` records every update to a CSV file and `--report` turns it into a page
+  of graphs; `--json` prints one snapshot for other scripts, `--svg` saves a
+  picture of the screen, and `sysmon.ini` sets which sections show and their
+  colors.
 - `--connect` sends the live view to `sysmon_server.py`, which shows every
   connected machine on one web page and as JSON for monitoring tools,
   optionally behind a password and over HTTPS (see
@@ -68,7 +70,9 @@ screen, so your previous terminal contents come back when it exits.
 | `-i SECONDS`, `--interval SECONDS` | `1` | Time between updates. Decimals are allowed; the minimum is `0.1`. |
 | `--once` | off | Collect for one interval, print a single snapshot and exit. |
 | `--json` | off | Collect for one interval, print a single snapshot [as JSON](#logging-and-json) and exit. |
+| `--svg FILE` | off | Collect for one interval, save a [picture of the screen](#pictures-of-the-screen) as an SVG file and exit. |
 | `--log FILE` | off | Append every update to a [CSV file](#logging-and-json). |
+| `--report CSV` | off | Turn a `--log` file into an [HTML page with graphs](#reports), saved next to it as `.html`, and exit. |
 | `--config FILE` | `sysmon.ini` next to the script | [Settings file](#settings-file). |
 | `--connect IP:PORT` | off | Also send every update to a [`sysmon_server.py`](#remote-monitoring) at this address. A host name works in place of the IP. IPv4 only [for now](#ipv6). Can't be combined with `--once` or `--json`. |
 | `--password PASSWORD` | the `SYSMON_PASSWORD` environment variable, or none | The server's [password](#password), if it has one |
@@ -90,10 +94,22 @@ Watch and record every update to a CSV file:
 python sysmon.py --log usage.csv
 ```
 
+See a recorded day as graphs (writes `usage.html`):
+
+```bash
+python sysmon.py --report usage.csv
+```
+
 Get the current numbers as JSON for another script:
 
 ```bash
 python sysmon.py --json > snapshot.json
+```
+
+Save a picture of the screen:
+
+```bash
+python sysmon.py --svg sysmon.svg
 ```
 
 Show this machine on the web page of a server at 192.168.1.10:
@@ -144,7 +160,7 @@ None of the Windows queries need administrator rights.
 
 ```
 Processes by CPU
-↑↓ select  ←→ sort  A group  K end  P hide
+↑↓ select  ←→ sort  / filter  T tree  A group  K end  P hide
 
       PID Name                     ▼CPU     Memory    GPU       VRAM
     36116 destiny2.exe             6.9%    3.8 GiB  16.6%    1.2 GiB
@@ -165,12 +181,19 @@ Processes by CPU
 |---|---|
 | **↑ / ↓** | Select a process. The selection stays on the same process while the table re-sorts. |
 | **← / →** | Sort by another column (marked `▼`) |
+| **/** | Filter by name: type part of it (upper or lower case doesn't matter), **Enter** keeps the filter, **Esc** clears it. |
+| **T** | Show the processes as a tree: each under the process that started it, the busiest first among siblings. Press again to go back. |
 | **A** | Group by program: one row per program name, adding up its processes, like Task Manager's app groups (GPU use is capped at 100 %). Press again to ungroup. |
 | **K** or **Delete** | End the selected process, or every process of the selected program. Asks first: **Y** ends it, any other key cancels. |
 
-- The table fills the window height. Processes using less than 0.1 % of the
-  sorted resource are left out: 0.1 % of the CPU, the GPU, the RAM or the VRAM,
-  and for I/O and network 0.1 % of what all processes use together.
+- The table fills the window height and scrolls with the selection when there
+  are more rows than fit; its last line then says which ones show, e.g.
+  `1-12 of 293`.
+- Processes using less than 0.1 % of the sorted resource are left out: 0.1 % of
+  the CPU, the GPU, the RAM or the VRAM, and for I/O and network 0.1 % of what
+  all processes use together. With a filter or in the tree, idle processes
+  show too.
+- A process whose parent has ended appears at the top level of the tree.
 - The sort column always shows; the other columns show as the pane's width
   allows.
 - CPU, I/O and network are rates, so right after the table opens they show
@@ -326,6 +349,37 @@ memory in bytes.
   new file.
 - Without a terminal, for example as a service or under `nohup`, sysmon only
   logs and draws nothing.
+
+### Reports
+
+`--report usage.csv` turns a log into `usage.html` next to it: one page with a
+graph per topic, and the minimum, average, maximum and last value of every line
+below it. It needs only the CSV file, so you can make the report on another
+machine.
+
+| Graph | Lines |
+|---|---|
+| CPU, Memory | Total use; RAM and swap / page file |
+| GPU load | Each GPU |
+| Disk speed | Each disk's read and write |
+| Network | Each adapter's download and upload |
+| Temperatures | Every sensor, GPU and disk that reported one |
+| Disk space used, Battery | Each drive; the charge |
+
+- Graphs for data the log doesn't have are left out.
+- Long logs are averaged into at most 600 points per line.
+- Where sysmon wasn't running, for example between two runs that share one log,
+  the lines stop instead of joining across the gap.
+- The page is a single HTML file with no scripts or outside resources, so it
+  can be mailed or opened anywhere.
+
+### Pictures of the screen
+
+`--svg sysmon.svg` collects for one interval and saves the system view as an
+SVG picture, with its colors, like the one at the top of this README. It uses
+the terminal's width; without a terminal, set the `COLUMNS` environment
+variable (for example to 120), or it's 80 columns. The picture shows what the
+screen shows, host name and IP addresses included.
 
 ## Remote monitoring
 
