@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="Assets/Img/SysMon-logo/svg/sysmon-lockup-on-dark.svg">
+    <img src="Assets/Img/SysMon-logo/svg/sysmon-lockup-on-light.svg" alt="SysMon" width="400">
+  </picture>
+</p>
+
 # sysmon
 
 A live system monitor for the terminal that runs on **Windows and Linux**. It
@@ -19,7 +26,7 @@ interval you choose).
   optionally behind a password and over HTTPS (see
   [Remote monitoring](#remote-monitoring)).
 
-![sysmon's main view in a 120-column Windows terminal: CPU with every core, memory, GPU, disks and network](screenshot.svg)
+![sysmon's main view in a 120-column Windows terminal: CPU with every core, memory, GPU, disks and network](Assets/Img/screenshot.svg)
 
 ## Requirements
 
@@ -742,7 +749,8 @@ says so in the header. This hasn't been tested.
 | `README.md` | This documentation |
 | `CHANGELOG.md` | What changed in each version |
 | `LICENSE` | The MIT license |
-| `screenshot.svg` | The picture of the main view at the top of this README |
+| `Assets/Img/screenshot.svg` | The picture of the main view at the top of this README |
+| `Assets/Img/SysMon-logo/` | The logo (SVG, PNG, ICO); the server's web page has the icon built in |
 
 ## License
 
