@@ -294,13 +294,16 @@ PAGE = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>sysmon sessions</title>
+<!-- The logo (Assets/Img/SysMon-logo/svg/sysmon-icon.svg) is inlined: this script stays a single file. -->
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect x='2' y='2' width='96' height='96' rx='22' fill='%230b1116' stroke='%23243039' stroke-width='1'/%3E%3Cpath d='M14 54 H31 L39 36 L50 72 L60 24 L68 54 H86' fill='none' stroke='%233ddc97' stroke-width='7' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <style>
   :root { color-scheme: dark; --bg: #0c0c0c; --panel: #161616; --line: #2c2c2c; --text: #cccccc;
           --muted: #8a8a8a; --live: #23d18b; --lost: #f14c4c; }
   body { margin: 0; padding: 16px; background: var(--bg); color: var(--text);
          font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
   header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 16px; margin-bottom: 16px; }
-  h1 { margin: 0; font-size: 18px; }
+  h1 { display: flex; align-items: center; gap: 10px; margin: 0; font-size: 18px; }
+  .logo { width: 28px; height: 28px; align-self: center; }
   code, pre { font-family: "Cascadia Mono", Consolas, "DejaVu Sans Mono", Menlo, monospace; }
   .muted { color: var(--muted); }
   #sessions { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 760px), 1fr)); gap: 16px; }
@@ -321,7 +324,7 @@ PAGE = r"""<!doctype html>
 </head>
 <body>
 <header>
-  <h1>sysmon sessions</h1>
+  <h1><svg class="logo" viewBox="0 0 100 100" aria-hidden="true"><rect x="2" y="2" width="96" height="96" rx="22" fill="#0b1116" stroke="#243039" stroke-width="1"/><path d="M14 54 H31 L39 36 L50 72 L60 24 L68 54 H86" fill="none" stroke="#3ddc97" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/></svg>sysmon sessions</h1>
   <span id="note" class="muted">Loading…</span>
 </header>
 <p id="empty" hidden>No sessions yet. On each machine to watch, run
